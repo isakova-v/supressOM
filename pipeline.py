@@ -16,9 +16,45 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Iterable, Tuple
 
+import logging
+LOG_LEVEL = os.getenv("PIPELINE_LOG", "INFO").upper()
+# Совместимый с tqdm хендлер: печатает через tqdm.write, чтобы логи не терялись
+class _TqdmHandler(logging.StreamHandler):
+    def emit(self, record):
+        try:
+            from tqdm import tqdm as _tqdm
+            msg = self.format(record)
+            _tqdm.write(msg)
+        except Exception:
+            super().emit(record)
+
+# Принудительно настраиваем root-логгер (basicConfig может быть проигнорирован без force=True)
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,
+)
+# Заменим потоковый хендлер на tqdm-совместимый, чтобы не конфликтовать с прогресс-барами
+_root = logging.getLogger()
+for h in list(_root.handlers):
+    _root.removeHandler(h)
+_h = _TqdmHandler()
+_h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s: %(message)s", "%H:%M:%S"))
+_root.addHandler(_h)
+_root.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+logger = logging.getLogger(__name__)
+
 import pandas as pd
 import requests
 from tqdm import tqdm
+try:
+    from reactome2py import content as rc
+    _HAS_REACTOME = True
+except Exception as e:
+    _HAS_REACTOME = False
+    logger.warning(f"[Reactome] reactome2py недоступен ({type(e).__name__}: {e}) — отключаю Reactome")
 
 # =========================
 # CONFIG
@@ -30,7 +66,7 @@ CONFIG = {
 
     # режимы (можно включить онлайн-пути по одному)
     "USE_ONLINE_ENSEMBL": True,       # Ensembl REST для маппинга ENSG → HGNC/UniProt
-    "USE_ONLINE_ONCOKB": False,       # OncoKB для уточнения TSG (нужен токен)
+    "USE_ONLINE_ONCOKB": True,       # OncoKB для уточнения TSG (нужен токен)
     "USE_ONLINE_CAUSAL": True,        # искать ингибиторы в SIGNOR/Reactome (при сбое → seed)
     "USE_ONLINE_CHEMBL": True,        # ChEMBL для Ki/Kd/IC50 (при сбое → seed)
     "USE_ONLINE_RLS": False,          # РЛС: Aurora API или best-effort rlsnet (см. ниже)
@@ -67,6 +103,13 @@ SEED_TSG = {
     "MEN1","MLH1","MSH2","MSH6","PMS2","ATM","ATR","CHEK2","FBXW7",
     "KEAP1","NFE2L2","CDH1","SMARCB1"
 }
+
+SEED_ONCOGENES = {
+    "EGFR","ERBB2","KRAS","NRAS","HRAS","BRAF","PIK3CA","AKT1","AKT2",
+    "ALK","ROS1","RET","MET","FGFR1","FGFR2","FGFR3","NTRK1","NTRK2","NTRK3",
+    "KIT","PDGFRA","PDGFRB","JAK2","MYC","CCND1","CDK4","CDK6","MDM2"
+}
+
 SEED_TSG_INHIBITORS: Dict[str, List[str]] = {
     "TP53": ["MDM2","MDM4"],
     "RB1":  ["CDK4","CDK6"],
@@ -90,7 +133,10 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 def read_csv_any(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path, sep=None, engine="python")
+    try:
+        return pd.read_csv(path, sep=None, engine="python")
+    except Exception:
+        return pd.read_csv(path)
 
 def clean_ensembl(x: str) -> Optional[str]:
     x = str(x).strip()
@@ -163,7 +209,12 @@ def ensembl_xrefs(ensg: str) -> dict:
     url = f"https://rest.ensembl.org/xrefs/id/{ensg}"
     s = session_json({"Content-Type": "application/json"})
     try:
-        r = s.get(url, timeout=CONFIG["TIMEOUT"], headers={"Content-Type":"application/json"})
+        for attempt in range(3):
+            r = s.get(url, timeout=CONFIG["TIMEOUT"], headers={"Content-Type":"application/json"})
+            if r.status_code == 429:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            break
         if r.status_code != 200:
             return {"hgnc":"", "uniprot":""}
         data = r.json()
@@ -203,9 +254,10 @@ def build_mapping_table(df_raw: pd.DataFrame, ens_list: List[str]) -> pd.DataFra
 # =========================
 # 3) TSG ANNOTATION (seed + OncoKB опционально)
 # =========================
-def onco_kb_is_tsg(hgnc: str) -> Tuple[bool, List[str]]:
+def oncokb_gene_flags(hgnc: str) -> Dict[str, object]:
+    """Возвращает {'is_tsg': bool, 'is_oncogene': bool, 'sources': [..]} по OncoKB (если доступен)."""
     if not (CONFIG["USE_ONLINE_ONCOKB"] and ENV["ONCOKB_TOKEN"]):
-        return False, []
+        return {"is_tsg": False, "is_oncogene": False, "sources": []}
     cache_key = f"oncokb_{hgnc}"
     cached = load_cache(cache_key)
     if cached is None:
@@ -220,27 +272,44 @@ def onco_kb_is_tsg(hgnc: str) -> Tuple[bool, List[str]]:
         save_cache(cache_key, data)
     else:
         data = cached
+
+    is_tsg = False
+    is_oncogene = False
     try:
         if isinstance(data, list) and data:
             g = data[0]
-            if g.get("tumorSuppressor", False):
-                return True, ["OncoKB"]
+            is_tsg = bool(g.get("tumorSuppressor", False))
+            is_oncogene = bool(g.get("oncogene", False))
     except Exception:
         pass
-    return False, []
+    sources = []
+    if is_tsg or is_oncogene:
+        sources.append("OncoKB")
+    return {"is_tsg": is_tsg, "is_oncogene": is_oncogene, "sources": sources}
 
 def annotate_tsg(hgnc_list: List[str]) -> Dict[str, Dict]:
-    out = {}
-    for g in hgnc_list:
-        is_seed = g in SEED_TSG
-        sources = ["SEED_TSG"] if is_seed else []
-        # дополнить OncoKB при наличии токена
-        okb, okb_src = onco_kb_is_tsg(g)
-        is_tsg = is_seed or okb
-        if okb_src:
-            sources.extend(okb_src)
-        out[g] = {"is_tsg": is_tsg, "sources": sorted(set(sources))}
+    """Как и было, но используем новые флаги."""
+    use_okb = bool(CONFIG.get("USE_ONLINE_ONCOKB")) and bool(ENV.get("ONCOKB_TOKEN"))
+    iterator: Iterable[str] = tqdm(hgnc_list, desc="OncoKB gene flags", unit="gene", total=len(hgnc_list), dynamic_ncols=True, leave=False) if use_okb else hgnc_list
+
+    out: Dict[str, Dict] = {}
+    for g in iterator:
+        seed_tsg = g in SEED_TSG
+        flags = oncokb_gene_flags(g) if use_okb else {"is_tsg": False, "is_oncogene": False, "sources": []}
+        is_tsg = seed_tsg or flags["is_tsg"]
+        sources = set(flags["sources"])
+        if seed_tsg:
+            sources.add("SEED_TSG")
+        out[g] = {"is_tsg": is_tsg, "is_oncogene": flags["is_oncogene"], "sources": sorted(sources)}
     return out
+
+def annotate_oncogenes_from_seed(hgnc_list: List[str]) -> Dict[str, bool]:
+    """Если OncoKB недоступен — быстрый флаг из сид-набора."""
+    if CONFIG.get("USE_ONLINE_ONCOKB") and ENV.get("ONCOKB_TOKEN"):
+        # уже покрыто annotate_tsg -> oncokb_gene_flags
+        return {g: False for g in hgnc_list}
+    return {g: (g in SEED_ONCOGENES) for g in hgnc_list}
+
 
 # =========================
 # 4) INHIBITORS (SIGNOR / Reactome) + fallback
@@ -266,25 +335,125 @@ def signor_inhibitors(tsg: str) -> List[Dict]:
     except Exception:
         return []
     out = []
-    # ожидаем список связей; поле имён может отличаться — перехватываем варианты
     for it in data if isinstance(data, list) else []:
         eff = (it.get("EFFECT") or it.get("effect") or "").lower()
         target = (it.get("TARGET") or it.get("to") or "").upper()
-        source = (it.get("ENTITYA") or it.get("from") or "").upper()
-        if target == tsg.upper() and any(k in eff for k in ["inhib","down"]):
+        source_raw = (it.get("ENTITYA") or it.get("from") or "").upper()
+        source = normalize_hgnc(source_raw)
+        if target == tsg.upper() and any(k in eff for k in ["inhib","down"]) and source:
             out.append({"inhibitor": source, "db": "SIGNOR", "edge_type": eff})
     time.sleep(CONFIG["SLEEP_BETWEEN_CALLS"])
     return out
 
 def reactome_inhibitors(tsg: str) -> List[Dict]:
     """
-    Reactome content service (best-effort, неоднозначно каузальность):
-      Пройдём simplified: поиск партнёров и, если есть описание regulation со словами inhibit/downreg, отметить.
-      Это приближённый метод; основную каузальность ждём от SIGNOR.
+    Ищет ингибиторов TSG через Reactome Content Service (reactome2py).
+    Возвращает список словарей:
+      {"inhibitor": <HGNC-подобное имя>, "db": "Reactome", "edge_type": "negative regulation"}
+    При сбоях пишет в лог предупреждение и возвращает [].
     """
-    out = []
-    # Поиск идентификатора Reactome/UniProt? Реализация очень вариативна; оставим пустым если нет чёткого пути.
-    return out
+    if not _HAS_REACTOME:
+        logger.warning(f"[Reactome] reactome2py не установлен — пропускаю поиск для {tsg}")
+        return []
+
+    cache_key = f"reactome_inhibitors_{tsg}"
+    cached = load_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    out: Dict[str, Dict] = {}
+
+    try:
+        # === 1) поиск сущностей-белков (EntityWithAccessionedSequence)
+        sr = rc.search_query(query=tsg, species=["Homo sapiens"], types=["PhysicalEntity"], rows=200)
+        pe_ids: List[str] = []
+        for cluster in (sr or {}).get("results", []):
+            for hit in cluster.get("entries", []):
+                if hit.get("type") == "EntityWithAccessionedSequence" and hit.get("stId"):
+                    pe_ids.append(hit["stId"])
+        pe_ids = list(dict.fromkeys(pe_ids))
+        if not pe_ids:
+            logger.info(f"[Reactome] {tsg}: не найдено белковых сущностей")
+            save_cache(cache_key, [])
+            return []
+
+        # === 2) собрать пути
+        pathway_ids: set = set()
+        for pe in pe_ids:
+            try:
+                paths = rc.pathways_low_entity(id=pe, species="Homo sapiens") or []
+                for p in paths:
+                    pid = p.get("stId") or p.get("dbId")
+                    if pid:
+                        pathway_ids.add(pid)
+            except Exception as e:
+                logger.debug(f"[Reactome] pathway_low_entity({pe}) error: {e}")
+            time.sleep(CONFIG["SLEEP_BETWEEN_CALLS"])
+        if not pathway_ids:
+            logger.info(f"[Reactome] {tsg}: пути не найдены")
+            save_cache(cache_key, [])
+            return []
+
+        # === 3) реакции в путях
+        reaction_ids: set = set()
+        for pid in pathway_ids:
+            try:
+                evs = rc.pathway_contained_event(id=pid) or []
+                for ev in evs:
+                    t = (ev.get("type") or ev.get("schemaClass", "")).lower()
+                    if t.startswith("reaction"):
+                        rid = ev.get("stId") or ev.get("dbId")
+                        if rid:
+                            reaction_ids.add(rid)
+            except Exception as e:
+                logger.debug(f"[Reactome] contained_event({pid}) error: {e}")
+            time.sleep(CONFIG["SLEEP_BETWEEN_CALLS"] / 2)
+        if not reaction_ids:
+            logger.info(f"[Reactome] {tsg}: реакции не найдены")
+            save_cache(cache_key, [])
+            return []
+
+        # === 4) анализ регулировок
+        for rid in list(reaction_ids)[:2000]:
+            try:
+                q = rc.query(id=rid, enhanced=True)
+            except Exception as e:
+                logger.debug(f"[Reactome] query({rid}) error: {e}")
+                continue
+
+            regs = q.get("regulatedBy") or q.get("regulations") or []
+            for reg in regs:
+                rtype = (reg.get("regulationType") or reg.get("displayName") or "").lower()
+                if not any(k in rtype for k in ("negative", "inhib")):
+                    continue
+                regulator = reg.get("regulator") or {}
+                names = regulator.get("name") or regulator.get("displayName") or []
+                if isinstance(names, str):
+                    names = [names]
+                for nm in names:
+                    sym = normalize_hgnc(nm) or (str(nm).split()[0].upper().strip("-:,;"))
+                    if not sym or sym == tsg.upper():
+                        continue
+                    if sym not in out:
+                        out[sym] = {
+                            "inhibitor": sym,
+                            "db": "Reactome",
+                            "edge_type": "negative regulation"
+                        }
+            time.sleep(CONFIG["SLEEP_BETWEEN_CALLS"] / 2)
+
+        result = list(out.values())
+        save_cache(cache_key, result)
+        if not result:
+            logger.info(f"[Reactome] {tsg}: нет ингибиторов")
+        else:
+            logger.info(f"[Reactome] {tsg}: найдено {len(result)} ингибиторов")
+        return result
+
+    except Exception as e:
+        logger.warning(f"[Reactome] {tsg}: сбой интеграции ({type(e).__name__}: {e})")
+        save_cache(cache_key, [])
+        return []
 
 def inhibitors_online(tsg: str) -> List[Dict]:
     got = []
@@ -314,6 +483,10 @@ def fetch_inhibitors_for_tsg(tsg: str) -> List[Dict]:
 # 5) LIGANDS + AFFINITIES (ChEMBL) + fallback
 # =========================
 def chembl_find_target_id_by_name(name: str) -> Optional[str]:
+    ck = f"chembl_tid_{name}"
+    cached = load_cache(ck)
+    if cached is not None:
+        return cached or None
     url = f"https://www.ebi.ac.uk/chembl/api/data/target/search.json?query={requests.utils.quote(name)}"
     s = session_json()
     try:
@@ -322,25 +495,44 @@ def chembl_find_target_id_by_name(name: str) -> Optional[str]:
         js = r.json()
         arr = js.get("targets", [])
         if not arr:
+            save_cache(ck, "")
             return None
         # берём первый exact/наиболее релевантный
-        return arr[0].get("target_chembl_id")
+        tid = arr[0].get("target_chembl_id")
+        save_cache(ck, tid or "")
+        return tid
     except Exception:
+        save_cache(ck, "")
         return None
 
 def chembl_best_activities_for_target(target_chembl_id: str) -> List[Dict]:
     """
     Возвращает лучшие (минимальные) Ki/Kd/IC50 по каждому лиганду для данного target_chembl_id.
     """
-    s = session_json()
-    fields = "molecule_chembl_id,standard_type,standard_units,standard_value,standard_relation,document_chembl_id"
-    url = f"https://www.ebi.ac.uk/chembl/api/data/activity.json?target_chembl_id={target_chembl_id}&limit=2000&fields={fields}"
-    try:
-        r = s.get(url, timeout=CONFIG["TIMEOUT"])
-        r.raise_for_status()
-        acts = r.json().get("activities", [])
-    except Exception:
-        return []
+    ck = f"chembl_acts_{target_chembl_id}"
+    cached = load_cache(ck)
+    if cached is not None:
+        acts = cached or []
+    else:
+        s = session_json()
+        fields = "molecule_chembl_id,standard_type,standard_units,standard_value,standard_relation,document_chembl_id"
+        acts = []
+        try:
+            offset = 0
+            while True:
+                url = (f"https://www.ebi.ac.uk/chembl/api/data/activity.json?"
+                       f"target_chembl_id={target_chembl_id}&limit=2000&offset={offset}&fields={fields}")
+                r = s.get(url, timeout=CONFIG["TIMEOUT"])
+                r.raise_for_status()
+                batch = r.json().get("activities", []) or []
+                acts.extend(batch)
+                if len(batch) < 2000:
+                    break
+                offset += 2000
+                time.sleep(CONFIG["SLEEP_BETWEEN_CALLS"])
+        except Exception:
+            acts = []
+        save_cache(ck, acts)
     def to_nm(val: str, units: str) -> Optional[float]:
         try:
             v = float(val)
@@ -391,6 +583,10 @@ def chembl_best_activities_for_target(target_chembl_id: str) -> List[Dict]:
     return out
 
 def chembl_molecule_name(chembl_id: str) -> Optional[str]:
+    ck = f"chembl_name_{chembl_id}"
+    cached = load_cache(ck)
+    if cached is not None:
+        return cached or None
     url = f"https://www.ebi.ac.uk/chembl/api/data/molecule/{chembl_id}.json"
     s = session_json()
     try:
@@ -399,12 +595,16 @@ def chembl_molecule_name(chembl_id: str) -> Optional[str]:
         js = r.json()
         pref = js.get("pref_name")
         if pref:
+            save_cache(ck, pref)
             return pref
         # иначе может быть у синонимов
         syns = js.get("molecule_synonyms", [])
         if syns:
-            return syns[0].get("synonyms")
+            name = syns[0].get("synonyms")
+            save_cache(ck, name or "")
+            return name
     except Exception:
+        save_cache(ck, "")
         return None
     return None
 
@@ -484,8 +684,18 @@ def run_pipeline() -> None:
     ensure_dir(out_dir)
     ensure_dir(Path(CONFIG["CACHE_DIR"]))
 
+    logger.info(
+        "CFG: Ensembl=%s OncoKB=%s Reactome/Signor=%s ChEMBL=%s RLS=%s/%s",
+        CONFIG['USE_ONLINE_ENSEMBL'], CONFIG['USE_ONLINE_ONCOKB'],
+        CONFIG['USE_ONLINE_CAUSAL'], CONFIG['USE_ONLINE_CHEMBL'],
+        CONFIG['USE_ONLINE_RLS'], CONFIG['RLS_MODE'],
+    )
+
     # 1) load
     df_raw, ens_list, patient_symbols = load_and_extract_ids(in_path)
+
+    if CONFIG["USE_ONLINE_ONCOKB"] and not ENV["ONCOKB_TOKEN"]:
+        logger.warning("[OncoKB] Токен не задан — флаг онкогена берём из SEED_ONCOGENES")
 
     # 2) mapping
     mapping = build_mapping_table(df_raw, ens_list)
@@ -493,18 +703,25 @@ def run_pipeline() -> None:
     tsg_anno = annotate_tsg([x for x in mapping["final_hgnc"].tolist() if x])
     mapping["is_tsg"] = mapping["final_hgnc"].map(lambda x: tsg_anno.get(x, {}).get("is_tsg", False))
     mapping["tsg_sources"] = mapping["final_hgnc"].map(lambda x: ";".join(tsg_anno.get(x, {}).get("sources", [])))
+    mapping["is_oncogene"] = mapping["final_hgnc"].map(lambda x: tsg_anno.get(x, {}).get("is_oncogene", False))
+
+    if not ENV.get("ONCOKB_TOKEN"):
+        seed_onco = annotate_oncogenes_from_seed([x for x in mapping["final_hgnc"].tolist() if x])
+        mapping.loc[mapping["final_hgnc"].isin(seed_onco.keys()), "is_oncogene"] = \
+            mapping["final_hgnc"].map(lambda x: seed_onco.get(x, False))
 
     # Список TSG у пациента
     tsg_rows = mapping[mapping["is_tsg"] & mapping["final_hgnc"].astype(bool)]
 
     # 3) inhibitors per TSG (и фильтрация по наличию у пациента)
-    patient_symbol_set = set(patient_symbols)
+    patient_symbol_set = {normalize_hgnc(s) for s in patient_symbols if s}
     pipeline_rows = []
+    seen_tsg = set()
     for _, row in tsg_rows.iterrows():
         tsg = row["final_hgnc"]
         rels = fetch_inhibitors_for_tsg(tsg)
         if CONFIG["REQUIRE_INHIBITOR_IN_PATIENT"]:
-            rels = [r for r in rels if r["inhibitor"] in patient_symbol_set]
+            rels = [r for r in rels if normalize_hgnc(r["inhibitor"]) in patient_symbol_set]
         if not rels:
             pipeline_rows.append({
                 "ensembl_id": row["ensembl_id"],
@@ -538,6 +755,10 @@ def run_pipeline() -> None:
                 continue
             for L in ligs:
                 ligand_name = L.get("ligand") or L.get("ligand_chembl_id")
+                key = (tsg, inh, str(ligand_name))
+                if key in seen_tsg:
+                    continue
+                seen_tsg.add(key)
                 rls = rls_status(str(ligand_name))
                 pipeline_rows.append({
                     "ensembl_id": row["ensembl_id"],
@@ -551,12 +772,64 @@ def run_pipeline() -> None:
                     "has_RLS_drug": rls["has_RLS_drug"],
                     "RLS_brand_names": ",".join(rls["brands"]) if rls["brands"] else None
                 })
+    
 
     pipeline_df = pd.DataFrame(pipeline_rows)
     if pipeline_df.empty:
         pipeline_df = pd.DataFrame(columns=[
             "ensembl_id","tsg_symbol","evidence_db","inhibitor","ligand",
             "affinity_type","affinity_value_nM","reference","has_RLS_drug","RLS_brand_names"
+        ])
+
+    # --- ONCOGENES: список у пациента
+    onc_rows = mapping[mapping["is_oncogene"] & mapping["final_hgnc"].astype(bool)]
+
+    onc_pipeline_rows = []
+    seen_pairs = set()  # (oncogene, ligand) — чтобы не было дублей
+
+    for _, row in onc_rows.iterrows():
+        target = row["final_hgnc"]  # онкоген как таргет
+        ligs = fetch_ligands_for_target(target)  # ChEMBL: бесплатный API
+
+        if not ligs:
+            onc_pipeline_rows.append({
+                "ensembl_id": row["ensembl_id"],
+                "oncogene_symbol": target,
+                "ligand": None,
+                "affinity_type": None,
+                "affinity_value_nM": None,
+                "reference": None,
+                "has_RLS_drug": None,
+                "RLS_brand_names": None,
+                "evidence_db": "ChEMBL"  # даже если пусто — источник такой же
+            })
+            continue
+
+        for L in ligs:
+            ligand_name = L.get("ligand") or L.get("ligand_chembl_id")
+            key = (target, str(ligand_name))
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+
+            rls = rls_status(str(ligand_name))  # бесплатный режим: scrape/off
+            onc_pipeline_rows.append({
+                "ensembl_id": row["ensembl_id"],
+                "oncogene_symbol": target,
+                "ligand": ligand_name,
+                "affinity_type": L.get("affinity_type"),
+                "affinity_value_nM": L.get("affinity_value_nM"),
+                "reference": L.get("reference"),
+                "has_RLS_drug": rls["has_RLS_drug"],
+                "RLS_brand_names": ",".join(rls["brands"]) if rls["brands"] else None,
+                "evidence_db": "ChEMBL"
+            })
+
+    oncogene_df = pd.DataFrame(onc_pipeline_rows)
+    if oncogene_df.empty:
+        oncogene_df = pd.DataFrame(columns=[
+            "ensembl_id","oncogene_symbol","ligand","affinity_type",
+            "affinity_value_nM","reference","has_RLS_drug","RLS_brand_names","evidence_db"
         ])
 
     # 4) отдельная таблица строк с найденным препаратом в РЛС
@@ -576,11 +849,21 @@ def run_pipeline() -> None:
         mapping.to_excel(w, index=False, sheet_name="ensembl_mapping")
         pipeline_df.to_excel(w, index=False, sheet_name="tsg_inhibitor_ligand")
         rls_hits.to_excel(w, index=False, sheet_name="rls_hits")
+        oncogene_df.to_excel(w, index=False, sheet_name="oncogene_ligands")
+        onc_hits = oncogene_df[oncogene_df["has_RLS_drug"] == True]
+        onc_hits.to_excel(w, index=False, sheet_name="oncogene_rls_hits")
+    
+    out_onco_csv = out_dir / "oncogene_ligands.csv"
+    onc_hits = oncogene_df[oncogene_df["has_RLS_drug"] == True]
 
-    print(f"[OK] mapping:  {out_mapping_csv}")
-    print(f"[OK] pipeline: {out_pipeline_xlsx}")
-    print(f"[OK] rls_hits: {out_rls_csv}")
-    print("Done.")
+    oncogene_df.to_csv(out_onco_csv, index=False)
+    logger.info(f"[OK] oncogenes: {out_onco_csv}")
+
+    logger.info("[OK] mapping:  %s", out_mapping_csv)
+    logger.info("[OK] pipeline: %s", out_pipeline_xlsx)
+    logger.info("[OK] rls_hits: %s", out_rls_csv)
+    logger.info("[OK] oncogenes: %s", out_onco_csv)
+    logger.info("Done.")
 
 # =========================
 # MAIN
@@ -590,4 +873,5 @@ if __name__ == "__main__":
     if (major, minor) < (3, 12):
         print(f"Python 3.12+ required, found {major}.{minor}", file=sys.stderr)
         sys.exit(1)
+    logger.info("[OncoKB] token: %s", "SET" if ENV["ONCOKB_TOKEN"] else "MISSING")
     run_pipeline()
