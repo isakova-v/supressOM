@@ -2,58 +2,58 @@
 # -*- coding: utf-8 -*-
 
 """
-Онкоген-центричный пайплайн (с DrugBank full database.xml):
+Онкоген-центричный пайплайн (через approved_drug_detailed_interactions, без DrugBank XML):
 
 1) Для данных пациента ищем онкогены.
 2) Для этих онкогенов ищем, какие супрессоры они блокируют (TRRUST, Repression).
-3) Для найденных супрессоров ищем лиганды (лекарственные средства), которые их активируют.
-4) Для онкогенов, блокирующих какие-либо из этих супрессоров, ищем лиганды, блокирующие онкогены.
+3) Для найденных супрессоров ищем approved-препараты из GtoPdb,
+   которые таргетируют эти супрессоры (approved_drug_detailed_interactions).
+4) Для онкогенов, блокирующих какие-либо из этих супрессоров, ищем approved-препараты,
+   таргетирующие онкогены (approved_drug_detailed_interactions).
 
-Используем те же источники, что и в TSG-пайплайне:
+⚠️ В этом пайплайне мы НЕ отличаем «активаторы» и «ингибиторы» по типу действия,
+потому что в approved_drug_detailed_interactions нет отдельной колонки Action.
+Все найденные препараты — просто препараты, таргетирующие данный ген.
+
+Дополнительно:
+- из RNA-seq берётся колонка log2FoldChange;
+- полные таблицы и финальные списки препаратов сортируются по модулю log2FoldChange
+  соответствующего гена:
+    * для TSG — по |log2FoldChange(tsg_symbol)|
+    * для онкогенов — по |log2FoldChange(oncogene_symbol)|
 
 Входные файлы
 -------------
 1) RNA-seq: top_5000_RNA-seq_5_stat_.csv
    - разделитель: ';'
-   - обязательная колонка: geneName (HGNC-символы)
+   - обязательные колонки: geneName, log2FoldChange (HGNC-символы)
 
 2) cancerGeneList.tsv
    - минимум: "Hugo Symbol", "Gene Type"
    - онкогены: Gene Type ∈ {"ONCOGENE", "ONCOGENE_AND_TSG"} (можно расширить)
+   - TSG: Gene Type ∈ {"TSG", "ONCOGENE_AND_TSG"}
 
-3) trrust_rawdata.human.tsv
-   - таб-разделённые колонки:
-     0: TF (регулятор)
-     1: Target gene (мишень)
-     2: Regulation ("Activation", "Repression", "Unknown")
-     3: PubMed IDs
+3) TRRUST-файл (например Processed_TRRUST.tsv)
+   - новый формат:
+       Gene   – регулятор (TF)
+       Target – мишень
+       Effect – 'Activation' / 'Repression' / 'Unknown'
+   - также поддерживаются старые RegNetwork-форматы (TF/Target/Regulation/PMID).
+   - внутри приводится к колонкам: regulator, target, regulation, pmids
 
-4) interactions.csv (GtoPdb Interactions Dataset)
-   - разделитель: запятая
-   - первая строка — комментарий ("# GtoPdb Version: ...") → header=1
-   - нужные колонки:
-       "Target Gene Symbol"
-       "Target"
-       "Target ID"
-       "Target Species"
-       "Primary Target"
+4) approved_drug_detailed_interactions.csv
+   - Детализированный датасет approved-препаратов и их взаимодействий (GtoPdb).
+   - первая строка — комментарий с версией, поэтому header=1.
+   - ключевые колонки:
        "Ligand"
        "Ligand ID"
-       "Ligand Type"
-       "Affinity Median"
-       "Affinity Units"
-       "Original Affinity Median nm"
-       "Original Affinity Relation"
-       "PubMed ID"
-       "Action"
-
-5) full database.xml (DrugBank full database)
-   - используем:
-       <drugbank-id>      → drugbank_id
-       <name>             → drugbank_name
-       <groups><group>    → drugbank_groups (множество статусов)
-   - препарат считается "одобренным", если среди group есть "approved"
-     (регистр не важен).
+       "Type"
+       "Clinical Use Comment"
+       "Bioactivity Comment"
+       "Target"
+       "Target ID"
+       "Target Gene Name"
+       "Target Species"
 
 Выходные файлы (в --out-dir)
 ----------------------------
@@ -65,67 +65,107 @@
    (онкоген репрессирует TSG в TRRUST)
 
 3) tsg_activating_drugs.tsv
-   - супрессоры и лиганды, их активирующие (agonist/activator/positive modulator/partial agonist)
+   - на самом деле: супрессоры и approved-препараты, их таргетирующие
+   - колонки:
+       tsg_symbol,
+       ligand_name, ligand_id, ligand_type,
+       clinical_use_comment, bioactivity_comment,
+       target_name, target_id, target_gene_symbol, target_species,
+       log2FoldChange, abs_log2FoldChange
+   - отсортировано по убыванию abs_log2FoldChange, затем tsg_symbol, ligand_name
 
-4) tsg_activating_drugs_approved.tsv  (DrugBank-approved)
-   - (3) ∩ approved по DrugBank (матч по ligand_name ↔ DrugBank name)
-   - + drugbank_id, drugbank_name, drugbank_groups
+4) tsg_activating_drugs_approved.tsv
+   - совпадает с (3), оставлено для совместимости.
 
 5) oncogene_blocking_drugs.tsv
-   - онкогены (из п.2), для которых найдены активируемые TSG из п.3, и лиганды, эти онкогены блокирующие
-     (Action ∈ {inhibitor, antagonist, blocker})
+   - онкогены (из п.2), для которых найдены таргетируемые TSG из п.3,
+     и approved-препараты, таргетирующие эти онкогены
+   - колонки:
+       oncogene_symbol,
+       ligand_name, ligand_id, ligand_type,
+       clinical_use_comment, bioactivity_comment,
+       target_name, target_id, target_gene_symbol, target_species,
+       log2FoldChange, abs_log2FoldChange
+   - отсортировано по убыванию abs_log2FoldChange, затем oncogene_symbol, ligand_name
 
-6) oncogene_blocking_drugs_approved.tsv (DrugBank-approved)
-   - аналогично (5) + DrugBank-колонки
+6) oncogene_blocking_drugs_approved.tsv
+   - совпадает с (5), оставлено для совместимости.
 
 7) tsg_activator_drug_list.tsv
-   - одна колонка ligand_name, уникальные препараты-активаторы супрессоров
+   - одна колонка ligand_name
+   - уникальные препараты, таргетирующие супрессоры,
+     отсортированы по убыванию максимального |log2FoldChange(tsg_symbol)|
 
 8) oncogene_blocker_drug_list.tsv
-   - одна колонка ligand_name, уникальные препараты-блокаторы онкогенов
+   - одна колонка ligand_name
+   - уникальные препараты, таргетирующие онкогены
+     (связанные с супрессорами), отсортированы по убыванию
+     максимального |log2FoldChange(oncogene_symbol)|
 
 9) all_oncogene_blocking_drugs.tsv / all_oncogene_blocking_drugs_approved.tsv
-   - блокаторы любых онкогенов пациента (независимо от связи с TSG)
+   - все approved-препараты, таргетирующие любые онкогены пациента
+     (независимо от связи с TSG)
+   - колонки:
+       oncogene_symbol,
+       ligand_name, ligand_id, ligand_type,
+       clinical_use_comment, bioactivity_comment,
+       target_name, target_id, target_gene_symbol, target_species,
+       log2FoldChange, abs_log2FoldChange
+   - отсортировано по убыванию abs_log2FoldChange, затем oncogene_symbol, ligand_name
 
 10) all_oncogene_blocker_drug_list.tsv
-   - список всех блокаторов онкогенов (любых)
+   - одна колонка ligand_name
+   - список всех препаратов, таргетирующих любые онкогены,
+     отсортированных по убыванию максимального |log2FoldChange(oncogene_symbol)|
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Iterable, Set, Tuple
+from typing import Iterable, Set, Tuple, Dict
 
-import xml.etree.ElementTree as ET
-
-import numpy as np
 import pandas as pd
 
 
 # --- Общие вспомогательные функции -----------------------------------------
 
 
-def load_patient_genes(rna_path: Path) -> Set[str]:
+def load_patient_genes(rna_path: Path) -> tuple[Set[str], Dict[str, float]]:
     """
     Загрузка генов пациента из RNA-seq файла.
 
-    Ожидается CSV с разделителем ';' и колонкой 'geneName'.
-    Значения NA/пустые строки отбрасываются.
+    Ожидается CSV с разделителем ';' и колонками:
+      - geneName
+      - log2FoldChange
+
+    Возвращает:
+      - множество генов пациента
+      - словарь geneName -> log2FoldChange
     """
     df = pd.read_csv(rna_path, sep=";")
-    if "geneName" not in df.columns:
-        raise ValueError(f"'geneName' column not found in {rna_path}")
 
-    genes = (
-        df["geneName"]
-        .dropna()
-        .astype(str)
-        .str.strip()
+    required = {"geneName", "log2FoldChange"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"RNA-seq file {rna_path} must contain columns {required}, "
+            f"missing: {missing}"
+        )
+
+    df = df.dropna(subset=["geneName"])
+    df["geneName"] = df["geneName"].astype(str).str.strip()
+    df = df[df["geneName"].str.upper() != "NA"]
+
+    df = df.copy()
+    df["log2FoldChange"] = pd.to_numeric(df["log2FoldChange"], errors="coerce")
+
+    genes = set(df["geneName"])
+    logfc_map: Dict[str, float] = (
+        df.set_index("geneName")["log2FoldChange"].to_dict()
     )
-    genes = genes[genes.str.upper() != "NA"]
 
-    return set(genes)
+    return genes, logfc_map
 
 
 def load_cancer_genes(
@@ -168,224 +208,122 @@ def load_cancer_genes(
 
 def load_trrust(trrust_path: Path) -> pd.DataFrame:
     """
-    Загрузка TRRUST (human).
+    Загрузка TRRUST-файла.
 
-    Формат: 4 таб-разделённых столбца:
-        TF, Target, Regulation, PubMed IDs
+    Поддерживаются варианты:
+      1) Новый Processed_TRRUST.tsv:
+         колонки 'Gene', 'Target', 'Effect'.
+         Маппинг:
+             Gene   → regulator
+             Target → target
+             Effect → regulation
+         pmids заполняется пустой строкой.
+
+      2) Старые RegNetwork-форматы:
+         TF, Target, Regulation, PMID (или Target gene / PubMed ID).
+         На выходе всегда:
+             regulator, target, regulation, pmids
     """
-    cols = ["regulator", "target", "regulation", "pmids"]
-    df = pd.read_csv(trrust_path, sep="\t", header=None, names=cols)
+    cols_std = ["regulator", "target", "regulation", "pmids"]
+    df = pd.read_csv(trrust_path, sep="\t")
 
+    # Вариант 1: новый Processed_TRRUST.tsv
+    if {"Gene", "Target", "Effect"}.issubset(df.columns):
+        df = df.rename(
+            columns={
+                "Gene": "regulator",
+                "Target": "target",
+                "Effect": "regulation",
+            }
+        )
+        df["pmids"] = ""
+        df = df[cols_std].copy()
+    else:
+        # Вариант 2: старый RegNetwork или уже приведённый формат
+        col_maps = [
+            {"TF": "regulator", "Target": "target", "Regulation": "regulation", "PMID": "pmids"},
+            {"TF": "regulator", "Target gene": "target", "Regulation": "regulation", "PMID": "pmids"},
+            {"TF": "regulator", "Target": "target", "Regulation": "regulation", "PubMed ID": "pmids"},
+            {"TF": "regulator", "Target gene": "target", "Regulation": "regulation", "PubMed ID": "pmids"},
+        ]
+
+        used_map = None
+        for cmap in col_maps:
+            if set(cmap.keys()).issubset(df.columns):
+                df = df.rename(columns=cmap)
+                used_map = cmap
+                break
+
+        if used_map is None:
+            # Возможно, это старый raw-файл без заголовка (4 столбца)
+            if df.shape[1] == 4 and set(df.columns) == {0, 1, 2, 3}:
+                df = pd.read_csv(trrust_path, sep="\t", header=None, names=cols_std)
+            else:
+                existing = {}
+                for c in cols_std:
+                    if c in df.columns:
+                        existing[c] = c
+                df = df.rename(columns=existing)
+
+        missing = [c for c in cols_std if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Не удалось привести TRRUST-файл {trrust_path} к стандартным колонкам. "
+                f"Отсутствуют: {missing}. Найдены колонки: {list(df.columns)}"
+            )
+
+        df = df[cols_std].copy()
+
+    # Нормализуем строки
     df["regulation"] = df["regulation"].astype(str).str.strip()
     df["regulator"] = df["regulator"].astype(str).str.strip()
     df["target"] = df["target"].astype(str).str.strip()
+    df["pmids"] = df["pmids"].astype(str).str.strip()
 
     return df
 
 
-def load_interactions(path: Path) -> pd.DataFrame:
+# --- approved_drug_detailed_interactions → таргеты и препараты ------------
+
+
+def load_approved_interactions(path: Path) -> pd.DataFrame:
     """
-    Загрузка interactions.csv из Guide to PHARMACOLOGY.
+    Загрузка approved_drug_detailed_interactions.csv (на основе GtoPdb).
+
+    Первая строка — комментарий → header=1.
+
+    Возвращает DataFrame с ключевыми колонками и дополнительным полем:
+      Target_Gene_upper (нормализованный HGNC).
     """
-    df = pd.read_csv(path, sep=",", header=1, low_memory=False)
+    df = pd.read_csv(path, header=1, low_memory=False)
 
     required_cols = [
-        "Target Gene Symbol",
-        "Target",
-        "Target ID",
-        "Target Species",
-        "Primary Target",
         "Ligand",
         "Ligand ID",
-        "Ligand Type",
-        "Affinity Median",
-        "Affinity Units",
-        "Original Affinity Median nm",
-        "Original Affinity Relation",
-        "PubMed ID",
-        "Action",
+        "Type",
+        "Clinical Use Comment",
+        "Bioactivity Comment",
+        "Target",
+        "Target ID",
+        "Target Gene Name",
+        "Target Species",
     ]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        raise ValueError(f"Нет колонок: {missing}\nНайдено: {list(df.columns)}")
-
-    df["Target_Gene_upper"] = (
-        df["Target Gene Symbol"].astype(str).str.upper().str.strip()
-    )
-    df["Action_upper"] = df["Action"].astype(str).str.upper().str.strip()
-
-    return df
-
-
-# --- DrugBank XML → approved препараты -------------------------------------
-
-
-def load_approved_ligands(path: Path) -> pd.DataFrame:
-    """
-    Загрузка DrugBank full database XML.
-
-    Извлекаем:
-      - drugbank_id  (primary=true, если есть, иначе первый <drugbank-id>)
-      - name         (основное имя препарата)
-      - drugbank_groups (список group, объединённый через ';')
-      - drugbank_name_norm (NAME в верхнем регистре, для матчинга)
-      - is_approved  (True, если среди groups есть 'approved')
-    """
-    ns = {"db": "http://www.drugbank.ca"}
-
-    tree = ET.parse(path)
-    root = tree.getroot()
-
-    rows = []
-
-    for drug in root.findall("db:drug", ns):
-        # drugbank-id (primary, если есть)
-        primary_id_elem = drug.find("db:drugbank-id[@primary='true']", ns)
-        if primary_id_elem is not None and primary_id_elem.text:
-            drugbank_id = primary_id_elem.text.strip()
-        else:
-            # fallback: первый <drugbank-id>
-            first_id = drug.find("db:drugbank-id", ns)
-            drugbank_id = (
-                first_id.text.strip()
-                if first_id is not None and first_id.text
-                else None
-            )
-
-        name_elem = drug.find("db:name", ns)
-        if name_elem is None or not name_elem.text:
-            continue
-        name = name_elem.text.strip()
-
-        groups_elem = drug.find("db:groups", ns)
-        groups_list = []
-        if groups_elem is not None:
-            for g in groups_elem.findall("db:group", ns):
-                if g.text:
-                    groups_list.append(g.text.strip())
-
-        if not groups_list:
-            # Можно не пропускать, но для наших целей нужны хотя бы какие-то группы
-            continue
-
-        groups_str = ";".join(groups_list)
-
-        rows.append(
-            {
-                "drugbank_id": drugbank_id,
-                "name": name,
-                "drugbank_groups": groups_str,
-            }
+        raise ValueError(
+            f"В approved_drug_detailed_interactions нет колонок: {missing}\n"
+            f"Найдено: {list(df.columns)}"
         )
 
-    if not rows:
-        raise RuntimeError(f"Не удалось извлечь ни одного препарата из {path}")
-
-    df = pd.DataFrame(rows)
-
-    df["drugbank_name_norm"] = (
-        df["name"].astype(str).str.strip().str.upper()
-    )
-    df["is_approved"] = df["drugbank_groups"].astype(str).str.contains(
-        "approved", case=False, na=False
+    df = df.copy()
+    df["Target_Gene_upper"] = (
+        df["Target Gene Name"].astype(str).str.strip().str.upper()
     )
 
     return df
-
-
-def filter_approved(
-    drugs_df: pd.DataFrame,
-    approved_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Оставляем только те строки из drugs_df, чьи ligand_name присутствуют
-    среди approved-препаратов в DrugBank (по имени, без регистра).
-
-    Возвращает drugs_df + добавленные колонки:
-      - drugbank_id
-      - drugbank_name
-      - drugbank_groups
-    """
-    approved_only = approved_df[approved_df["is_approved"]].copy()
-
-    if approved_only.empty or drugs_df.empty:
-        return drugs_df.iloc[0:0].copy()
-
-    # Уникальные DrugBank-записи по нормализованному имени
-    approved_unique = (
-        approved_only
-        .loc[:, ["drugbank_id", "name", "drugbank_name_norm", "drugbank_groups"]]
-        .drop_duplicates(subset=["drugbank_name_norm"])
-    )
-
-    tsg = drugs_df.copy()
-    tsg["ligand_name_norm"] = (
-        tsg["ligand_name"].astype(str).str.strip().str.upper()
-    )
-
-    merged = tsg.merge(
-        approved_unique,
-        left_on="ligand_name_norm",
-        right_on="drugbank_name_norm",
-        how="inner",
-    )
-
-    if merged.empty:
-        return merged
-
-    merged = merged.rename(
-        columns={
-            "name": "drugbank_name",
-        }
-    )
-
-    merged = merged.drop(columns=["ligand_name_norm", "drugbank_name_norm"])
-
-    return merged
-
-
-def parse_affinity(value):
-    """Преобразование строк вида '<1', '>1000' и чисел в float (нМ)."""
-    if pd.isna(value):
-        return np.inf
-
-    s = str(value).strip()
-
-    if s.startswith("<"):
-        try:
-            return float(s[1:])
-        except Exception:
-            return np.inf
-
-    if s.startswith(">"):
-        try:
-            return float(s[1:])
-        except Exception:
-            return np.inf
-
-    try:
-        return float(s)
-    except Exception:
-        return np.inf
 
 
 # --- Специфическая логика пайплайна ----------------------------------------
-
-
-# действия, активирующие таргет
-ACTIVATING_ACTIONS = {
-    "AGONIST",
-    "ACTIVATOR",
-    "POSITIVE MODULATOR",
-    "PARTIAL AGONIST",
-}
-
-# действия, блокирующие таргет
-INHIBITING_ACTIONS = {
-    "INHIBITOR",
-    "ANTAGONIST",
-    "BLOCKER",
-}
 
 
 def build_oncogene_tsg_repressions(
@@ -432,145 +370,147 @@ def build_oncogene_tsg_repressions(
 def build_tsg_activating_drugs(
     oncogene_tsg_df: pd.DataFrame,
     interactions: pd.DataFrame,
+    logfc_map: Dict[str, float],
     human_only: bool = True,
-    primary_only: bool = True,
 ) -> pd.DataFrame:
     """
-    Для найденных супрессоров (tsg_symbol) ищем лиганды, их активирующие.
+    Для найденных супрессоров (tsg_symbol) ищем approved-препараты,
+    таргетирующие эти TSG (по Target Gene Name).
 
-    - фильтр по Target Species == Human (опционально)
-    - фильтр по Primary Target == True (опционально)
-    - Action ∈ ACTIVATING_ACTIONS
+    Фильтр:
+      - Target Species == 'Human' (опционально).
+
+    Возвращает таблицу с колонками:
+      tsg_symbol,
+      ligand_name, ligand_id, ligand_type,
+      clinical_use_comment, bioactivity_comment,
+      target_name, target_id, target_gene_symbol, target_species,
+      log2FoldChange, abs_log2FoldChange.
+
+    Отсортировано по убыванию abs_log2FoldChange, затем tsg_symbol, ligand_name.
     """
-    if oncogene_tsg_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "tsg_symbol",
-                "target_name",
-                "target_id",
-                "target_gene_symbol",
-                "ligand_name",
-                "ligand_id",
-                "ligand_type",
-                "affinity_median",
-                "affinity_units",
-                "original_affinity_median_nm",
-                "original_affinity_relation",
-                "interaction_pubmed_id",
-                "action",
-            ]
-        )
-
-    tsgs = set(oncogene_tsg_df["tsg_symbol"].astype(str).str.upper())
-
-    df_int = interactions.copy()
-
-    if human_only:
-        df_int = df_int[df_int["Target Species"] == "Human"]
-
-    if primary_only:
-        df_int = df_int[df_int["Primary Target"] == True]
-
-    df_int = df_int[df_int["Action_upper"].isin(ACTIVATING_ACTIONS)]
-    df_int = df_int[df_int["Target_Gene_upper"].isin(tsgs)]
-
-    if df_int.empty:
-        return pd.DataFrame(
-            columns=[
-                "tsg_symbol",
-                "target_name",
-                "target_id",
-                "target_gene_symbol",
-                "ligand_name",
-                "ligand_id",
-                "ligand_type",
-                "affinity_median",
-                "affinity_units",
-                "original_affinity_median_nm",
-                "original_affinity_relation",
-                "interaction_pubmed_id",
-                "action",
-            ]
-        )
-
-    df_int = df_int.rename(
-        columns={
-            "Target": "target_name",
-            "Target ID": "target_id",
-            "Target Gene Symbol": "target_gene_symbol",
-            "Ligand": "ligand_name",
-            "Ligand ID": "ligand_id",
-            "Ligand Type": "ligand_type",
-            "Affinity Median": "affinity_median",
-            "Affinity Units": "affinity_units",
-            "Original Affinity Median nm": "original_affinity_median_nm",
-            "Original Affinity Relation": "original_affinity_relation",
-            "PubMed ID": "interaction_pubmed_id",
-            "Action": "action",
-        }
-    )
-
-    df_int["tsg_symbol"] = df_int["target_gene_symbol"].astype(str).str.strip()
-
     cols = [
         "tsg_symbol",
-        "target_name",
-        "target_id",
-        "target_gene_symbol",
         "ligand_name",
         "ligand_id",
         "ligand_type",
-        "affinity_median",
-        "affinity_units",
-        "original_affinity_median_nm",
-        "original_affinity_relation",
-        "interaction_pubmed_id",
-        "action",
+        "clinical_use_comment",
+        "bioactivity_comment",
+        "target_name",
+        "target_id",
+        "target_gene_symbol",
+        "target_species",
+        "log2FoldChange",
+        "abs_log2FoldChange",
     ]
 
-    return df_int[cols].sort_values(["tsg_symbol", "ligand_name"])
+    if oncogene_tsg_df.empty or interactions.empty:
+        return pd.DataFrame(columns=cols)
+
+    tsgs_upper = set(
+        oncogene_tsg_df["tsg_symbol"].astype(str).str.upper()
+    )
+
+    df_int = interactions.copy()
+    if human_only:
+        df_int = df_int[df_int["Target Species"] == "Human"]
+
+    df_int = df_int[df_int["Target_Gene_upper"].isin(tsgs_upper)]
+
+    if df_int.empty:
+        return pd.DataFrame(columns=cols)
+
+    df_int = df_int.copy()
+    df_int["tsg_symbol"] = df_int["Target Gene Name"].astype(str).str.strip()
+
+    result = df_int.assign(
+        ligand_name=lambda d: d["Ligand"],
+        ligand_id=lambda d: d["Ligand ID"],
+        ligand_type=lambda d: d["Type"],
+        clinical_use_comment=lambda d: d["Clinical Use Comment"],
+        bioactivity_comment=lambda d: d["Bioactivity Comment"],
+        target_name=lambda d: d["Target"],
+        target_id=lambda d: d["Target ID"],
+        target_gene_symbol=lambda d: d["Target Gene Name"],
+        target_species=lambda d: d["Target Species"],
+    )[
+        [
+            "tsg_symbol",
+            "ligand_name",
+            "ligand_id",
+            "ligand_type",
+            "clinical_use_comment",
+            "bioactivity_comment",
+            "target_name",
+            "target_id",
+            "target_gene_symbol",
+            "target_species",
+        ]
+    ].drop_duplicates()
+
+    # добавляем log2FoldChange и модуль
+    result["log2FoldChange"] = result["tsg_symbol"].map(logfc_map)
+    result["abs_log2FoldChange"] = result["log2FoldChange"].abs()
+
+    return result.sort_values(
+        ["abs_log2FoldChange", "tsg_symbol", "ligand_name"],
+        ascending=[False, True, True],
+    )
 
 
 def build_oncogene_blocking_drugs(
     oncogene_tsg_df: pd.DataFrame,
     tsg_activating_drugs_df: pd.DataFrame,
     interactions: pd.DataFrame,
+    logfc_map: Dict[str, float],
     human_only: bool = True,
-    primary_only: bool = True,
 ) -> pd.DataFrame:
     """
-    Для онкогенов, блокирующих супрессоры с найденными активирующими лигандами,
-    ищем лиганды, блокирующие эти онкогены.
+    Для онкогенов, блокирующих супрессоры с найденными таргетируемыми препаратами,
+    ищем approved-препараты, таргетирующие эти онкогены.
 
-    - берём TSG, для которых есть активирующие лиганды
-    - смотрим, какие онкогены их репрессируют (из oncogene_tsg_df)
-    - для таких онкогенов смотрим interactions с Action ∈ INHIBITING_ACTIONS
+    - Берём TSG, для которых есть препараты (tsg_activating_drugs_df).
+    - Смотрим, какие онкогены их репрессируют (oncogene_tsg_df).
+    - Для таких онкогенов фильтруем interactions по:
+        Target_Gene_upper ∈ онкогены
+        (и опц. human_only).
+
+    Возвращает таблицу:
+      oncogene_symbol,
+      ligand_name, ligand_id, ligand_type,
+      clinical_use_comment, bioactivity_comment,
+      target_name, target_id, target_gene_symbol, target_species,
+      log2FoldChange, abs_log2FoldChange.
+
+    Отсортировано по убыванию abs_log2FoldChange, затем oncogene_symbol, ligand_name.
     """
-    if oncogene_tsg_df.empty or tsg_activating_drugs_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "oncogene_symbol",
-                "target_name",
-                "target_id",
-                "target_gene_symbol",
-                "ligand_name",
-                "ligand_id",
-                "ligand_type",
-                "affinity_median",
-                "affinity_units",
-                "original_affinity_median_nm",
-                "original_affinity_relation",
-                "interaction_pubmed_id",
-                "action",
-            ]
-        )
+    cols = [
+        "oncogene_symbol",
+        "ligand_name",
+        "ligand_id",
+        "ligand_type",
+        "clinical_use_comment",
+        "bioactivity_comment",
+        "target_name",
+        "target_id",
+        "target_gene_symbol",
+        "target_species",
+        "log2FoldChange",
+        "abs_log2FoldChange",
+    ]
 
-    # TSG, для которых есть активирующие лиганды
+    if (
+        oncogene_tsg_df.empty
+        or tsg_activating_drugs_df.empty
+        or interactions.empty
+    ):
+        return pd.DataFrame(columns=cols)
+
+    # TSG, для которых есть препараты
     tsg_with_drugs = set(
         tsg_activating_drugs_df["tsg_symbol"].astype(str).str.upper()
     )
 
-    # Онкогены, которые репрессируют эти TSG
     tmp = oncogene_tsg_df.copy()
     tmp["tsg_upper"] = tmp["tsg_symbol"].astype(str).str.upper()
     tmp["oncogene_upper"] = tmp["oncogene_symbol"].astype(str).str.upper()
@@ -578,194 +518,141 @@ def build_oncogene_blocking_drugs(
     tmp = tmp[tmp["tsg_upper"].isin(tsg_with_drugs)]
 
     if tmp.empty:
-        return pd.DataFrame(
-            columns=[
-                "oncogene_symbol",
-                "target_name",
-                "target_id",
-                "target_gene_symbol",
-                "ligand_name",
-                "ligand_id",
-                "ligand_type",
-                "affinity_median",
-                "affinity_units",
-                "original_affinity_median_nm",
-                "original_affinity_relation",
-                "interaction_pubmed_id",
-                "action",
-            ]
-        )
+        return pd.DataFrame(columns=cols)
 
     oncogenes_of_interest = set(tmp["oncogene_upper"])
 
     df_int = interactions.copy()
-
     if human_only:
         df_int = df_int[df_int["Target Species"] == "Human"]
 
-    if primary_only:
-        df_int = df_int[df_int["Primary Target"] == True]
-
-    df_int = df_int[df_int["Action_upper"].isin(INHIBITING_ACTIONS)]
     df_int = df_int[df_int["Target_Gene_upper"].isin(oncogenes_of_interest)]
 
     if df_int.empty:
-        return pd.DataFrame(
-            columns=[
-                "oncogene_symbol",
-                "target_name",
-                "target_id",
-                "target_gene_symbol",
-                "ligand_name",
-                "ligand_id",
-                "ligand_type",
-                "affinity_median",
-                "affinity_units",
-                "original_affinity_median_nm",
-                "original_affinity_relation",
-                "interaction_pubmed_id",
-                "action",
-            ]
-        )
+        return pd.DataFrame(columns=cols)
 
-    df_int = df_int.rename(
-        columns={
-            "Target": "target_name",
-            "Target ID": "target_id",
-            "Target Gene Symbol": "target_gene_symbol",
-            "Ligand": "ligand_name",
-            "Ligand ID": "ligand_id",
-            "Ligand Type": "ligand_type",
-            "Affinity Median": "affinity_median",
-            "Affinity Units": "affinity_units",
-            "Original Affinity Median nm": "original_affinity_median_nm",
-            "Original Affinity Relation": "original_affinity_relation",
-            "PubMed ID": "interaction_pubmed_id",
-            "Action": "action",
-        }
+    df_int = df_int.copy()
+    df_int["oncogene_symbol"] = df_int["Target Gene Name"].astype(str).str.strip()
+
+    result = df_int.assign(
+        ligand_name=lambda d: d["Ligand"],
+        ligand_id=lambda d: d["Ligand ID"],
+        ligand_type=lambda d: d["Type"],
+        clinical_use_comment=lambda d: d["Clinical Use Comment"],
+        bioactivity_comment=lambda d: d["Bioactivity Comment"],
+        target_name=lambda d: d["Target"],
+        target_id=lambda d: d["Target ID"],
+        target_gene_symbol=lambda d: d["Target Gene Name"],
+        target_species=lambda d: d["Target Species"],
+    )[
+        [
+            "oncogene_symbol",
+            "ligand_name",
+            "ligand_id",
+            "ligand_type",
+            "clinical_use_comment",
+            "bioactivity_comment",
+            "target_name",
+            "target_id",
+            "target_gene_symbol",
+            "target_species",
+        ]
+    ].drop_duplicates()
+
+    result["log2FoldChange"] = result["oncogene_symbol"].map(logfc_map)
+    result["abs_log2FoldChange"] = result["log2FoldChange"].abs()
+
+    return result.sort_values(
+        ["abs_log2FoldChange", "oncogene_symbol", "ligand_name"],
+        ascending=[False, True, True],
     )
-
-    df_int["oncogene_symbol"] = df_int["target_gene_symbol"].astype(str).str.strip()
-
-    cols = [
-        "oncogene_symbol",
-        "target_name",
-        "target_id",
-        "target_gene_symbol",
-        "ligand_name",
-        "ligand_id",
-        "ligand_type",
-        "affinity_median",
-        "affinity_units",
-        "original_affinity_median_nm",
-        "original_affinity_relation",
-        "interaction_pubmed_id",
-        "action",
-    ]
-
-    return df_int[cols].sort_values(["oncogene_symbol", "ligand_name"])
 
 
 def build_all_oncogene_blocking_drugs(
     patient_oncogenes: Set[str],
     interactions: pd.DataFrame,
+    logfc_map: Dict[str, float],
     human_only: bool = True,
-    primary_only: bool = True,
 ) -> pd.DataFrame:
     """
-    Ищем лиганды, блокирующие ЛЮБЫЕ онкогены пациента,
-    независимо от того, блокируют ли они супрессоры.
+    Ищем approved-препараты, таргетирующие ЛЮБЫЕ онкогены пациента,
+    независимо от связи с TSG.
 
-    - Target Gene Symbol ∈ patient_oncogenes
-    - Action ∈ INHIBITING_ACTIONS
+    - Target_Gene_upper ∈ patient_oncogenes
+
+    Возвращает:
+      oncogene_symbol,
+      ligand_name, ligand_id, ligand_type,
+      clinical_use_comment, bioactivity_comment,
+      target_name, target_id, target_gene_symbol, target_species,
+      log2FoldChange, abs_log2FoldChange.
+
+    Отсортировано по убыванию abs_log2FoldChange, затем oncogene_symbol, ligand_name.
     """
-    if not patient_oncogenes:
-        return pd.DataFrame(
-            columns=[
-                "oncogene_symbol",
-                "target_name",
-                "target_id",
-                "target_gene_symbol",
-                "ligand_name",
-                "ligand_id",
-                "ligand_type",
-                "affinity_median",
-                "affinity_units",
-                "original_affinity_median_nm",
-                "original_affinity_relation",
-                "interaction_pubmed_id",
-                "action",
-            ]
-        )
+    cols = [
+        "oncogene_symbol",
+        "ligand_name",
+        "ligand_id",
+        "ligand_type",
+        "clinical_use_comment",
+        "bioactivity_comment",
+        "target_name",
+        "target_id",
+        "target_gene_symbol",
+        "target_species",
+        "log2FoldChange",
+        "abs_log2FoldChange",
+    ]
+
+    if not patient_oncogenes or interactions.empty:
+        return pd.DataFrame(columns=cols)
 
     onco_upper = {g.upper() for g in patient_oncogenes}
 
     df_int = interactions.copy()
-
     if human_only:
         df_int = df_int[df_int["Target Species"] == "Human"]
 
-    if primary_only:
-        df_int = df_int[df_int["Primary Target"] == True]
-
-    df_int = df_int[df_int["Action_upper"].isin(INHIBITING_ACTIONS)]
     df_int = df_int[df_int["Target_Gene_upper"].isin(onco_upper)]
 
     if df_int.empty:
-        return pd.DataFrame(
-            columns=[
-                "oncogene_symbol",
-                "target_name",
-                "target_id",
-                "target_gene_symbol",
-                "ligand_name",
-                "ligand_id",
-                "ligand_type",
-                "affinity_median",
-                "affinity_units",
-                "original_affinity_median_nm",
-                "original_affinity_relation",
-                "interaction_pubmed_id",
-                "action",
-            ]
-        )
+        return pd.DataFrame(columns=cols)
 
-    df_int = df_int.rename(
-        columns={
-            "Target": "target_name",
-            "Target ID": "target_id",
-            "Target Gene Symbol": "target_gene_symbol",
-            "Ligand": "ligand_name",
-            "Ligand ID": "ligand_id",
-            "Ligand Type": "ligand_type",
-            "Affinity Median": "affinity_median",
-            "Affinity Units": "affinity_units",
-            "Original Affinity Median nm": "original_affinity_median_nm",
-            "Original Affinity Relation": "original_affinity_relation",
-            "PubMed ID": "interaction_pubmed_id",
-            "Action": "action",
-        }
+    df_int = df_int.copy()
+    df_int["oncogene_symbol"] = df_int["Target Gene Name"].astype(str).str.strip()
+
+    result = df_int.assign(
+        ligand_name=lambda d: d["Ligand"],
+        ligand_id=lambda d: d["Ligand ID"],
+        ligand_type=lambda d: d["Type"],
+        clinical_use_comment=lambda d: d["Clinical Use Comment"],
+        bioactivity_comment=lambda d: d["Bioactivity Comment"],
+        target_name=lambda d: d["Target"],
+        target_id=lambda d: d["Target ID"],
+        target_gene_symbol=lambda d: d["Target Gene Name"],
+        target_species=lambda d: d["Target Species"],
+    )[
+        [
+            "oncogene_symbol",
+            "ligand_name",
+            "ligand_id",
+            "ligand_type",
+            "clinical_use_comment",
+            "bioactivity_comment",
+            "target_name",
+            "target_id",
+            "target_gene_symbol",
+            "target_species",
+        ]
+    ].drop_duplicates()
+
+    result["log2FoldChange"] = result["oncogene_symbol"].map(logfc_map)
+    result["abs_log2FoldChange"] = result["log2FoldChange"].abs()
+
+    return result.sort_values(
+        ["abs_log2FoldChange", "oncogene_symbol", "ligand_name"],
+        ascending=[False, True, True],
     )
-
-    df_int["oncogene_symbol"] = df_int["target_gene_symbol"].astype(str).str.strip()
-
-    cols = [
-        "oncogene_symbol",
-        "target_name",
-        "target_id",
-        "target_gene_symbol",
-        "ligand_name",
-        "ligand_id",
-        "ligand_type",
-        "affinity_median",
-        "affinity_units",
-        "original_affinity_median_nm",
-        "original_affinity_relation",
-        "interaction_pubmed_id",
-        "action",
-    ]
-
-    return df_int[cols].sort_values(["oncogene_symbol", "ligand_name"])
 
 
 # --- main ------------------------------------------------------------------
@@ -774,50 +661,57 @@ def build_all_oncogene_blocking_drugs(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Онкоген-центричный пайплайн: "
+            "Онкоген-центричный пайплайн (approved_drug_detailed_interactions): "
             "1) онкогены пациента → 2) супрессоры, которые они блокируют (TRRUST) → "
-            "3) активирующие супрессоры препараты → 4) препараты, блокирующие онкогены. "
-            "(DrugBank full database.xml как источник approved-препаратов)"
+            "3) approved-препараты для супрессоров → "
+            "4) approved-препараты для онкогенов, с сортировкой по |log2FoldChange|."
         )
     )
 
-    parser.add_argument("--rna", type=Path, required=True,
-                        help="Путь к RNA-seq CSV (top_5000_RNA-seq_5_stat_.csv).")
-    parser.add_argument("--cancer-list", type=Path, required=True,
-                        help="Путь к cancerGeneList.tsv.")
-    parser.add_argument("--trrust", type=Path, required=True,
-                        help="Путь к trrust_rawdata.human.tsv.")
-    parser.add_argument("--interactions", type=Path, required=True,
-                        help="Путь к GtoPdb interactions.csv.")
-
-    # DrugBank XML (оставляем старое имя параметра как алиас)
     parser.add_argument(
-        "--drugbank-xml",
-        "--approved-interactions",
-        dest="drugbank_xml",
+        "--rna",
         type=Path,
-        required=False,
-        help="(Опционально) Путь к DrugBank full database XML (full database.xml).",
+        required=True,
+        help="Путь к RNA-seq CSV (top_5000_RNA-seq_5_stat_.csv).",
     )
-
+    parser.add_argument(
+        "--cancer-list",
+        type=Path,
+        required=True,
+        help="Путь к cancerGeneList.tsv.",
+    )
+    parser.add_argument(
+        "--trrust",
+        type=Path,
+        required=True,
+        help="Путь к TRRUST-файлу (например, Processed_TRRUST.tsv).",
+    )
+    parser.add_argument(
+        "--approved-interactions",
+        type=Path,
+        required=True,
+        help="Путь к approved_drug_detailed_interactions.csv.",
+    )
     parser.add_argument(
         "--out-dir",
         type=Path,
         default=Path("."),
         help="Каталог для записи результатов (по умолчанию: текущий).",
     )
-
-    parser.add_argument("--no-human-filter", action="store_true",
-                        help="Не ограничивать Target Species == 'Human'.")
-    parser.add_argument("--no-primary-only", action="store_true",
-                        help="Не ограничивать Primary Target == True.")
+    parser.add_argument(
+        "--no-human-filter",
+        action="store_true",
+        help="Не ограничивать Target Species == 'Human'.",
+    )
 
     args = parser.parse_args()
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    human_only = not args.no_human_filter
+
     # --- 1) Гены пациента, онкогены и TSG -----------------------------------
-    patient_genes = load_patient_genes(args.rna)
+    patient_genes, rna_logfc = load_patient_genes(args.rna)
 
     oncogenes_all, tsg_all, cancer_df = load_cancer_genes(args.cancer_list)
 
@@ -842,8 +736,10 @@ def main():
 
     onco_path = out_dir / "patient_oncogenes.tsv"
     onco_df.to_csv(onco_path, sep="\t", index=False)
-    print(f"Онкогены пациента записаны в: {onco_path} "
-          f"({len(onco_df)} генов)")
+    print(
+        f"Онкогены пациента записаны в: {onco_path} "
+        f"({len(onco_df)} генов)"
+    )
 
     # --- 2) Какие супрессоры они блокируют (TRRUST, Repression) ------------
     trrust_df = load_trrust(args.trrust)
@@ -861,222 +757,161 @@ def main():
         f"→ {oncogene_tsg_path}"
     )
 
-    # --- 3) Для найденных супрессоров ищем активирующие лиганды ------------
-    interactions = load_interactions(args.interactions)
+    # --- 3) approved_drug_detailed_interactions ----------------------------
+    interactions = load_approved_interactions(args.approved_interactions)
 
-    human_only = not args.no_human_filter
-    primary_only = not args.no_primary_only
+    n_drugs = interactions["Ligand"].nunique()
+    print(
+        f"Из approved_drug_detailed_interactions извлечено записей: {len(interactions)}, "
+        f"уникальных препаратов (Ligand): {n_drugs}"
+    )
 
-    # --- 3a) ЛЮБЫЕ блокаторы всех онкогенов пациента -----------------------
+    # --- 3a) ЛЮБЫЕ препараты для всех онкогенов пациента -------------------
     all_onco_blocking_drugs_df = build_all_oncogene_blocking_drugs(
         patient_oncogenes=set(patient_oncogenes),
         interactions=interactions,
+        logfc_map=rna_logfc,
         human_only=human_only,
-        primary_only=primary_only,
     )
 
     all_onco_drugs_path = out_dir / "all_oncogene_blocking_drugs.tsv"
     all_onco_blocking_drugs_df.to_csv(all_onco_drugs_path, sep="\t", index=False)
     print(
-        f"Лекарства, блокирующие любые онкогены пациента: "
+        f"Препараты, таргетирующие любые онкогены пациента: "
         f"{len(all_onco_blocking_drugs_df)} строк → {all_onco_drugs_path}"
     )
 
-    # (опц.) фильтр по DrugBank-approved
-    if args.drugbank_xml is not None:
-        approved_df = load_approved_ligands(args.drugbank_xml)
-        n_total = len(approved_df)
-        n_approved = int(approved_df["is_approved"].sum())
-        print(
-            f"DrugBank: извлечено препаратов {n_total}, "
-            f"из них с группой 'approved': {n_approved}"
-        )
+    # approved-only: файл с суффиксом _approved оставляем для совместимости
+    all_onco_blocking_approved_path = (
+        out_dir / "all_oncogene_blocking_drugs_approved.tsv"
+    )
+    all_onco_blocking_drugs_df.to_csv(
+        all_onco_blocking_approved_path, sep="\t", index=False
+    )
+    print(
+        f"(Approved) препараты, таргетирующие любые онкогены пациента: "
+        f"{len(all_onco_blocking_drugs_df)} строк → "
+        f"{all_onco_blocking_approved_path}"
+    )
 
-        all_onco_blocking_approved = filter_approved(
-            all_onco_blocking_drugs_df, approved_df
-        )
-        all_onco_blocking_approved_path = (
-            out_dir / "all_oncogene_blocking_drugs_approved.tsv"
-        )
-        all_onco_blocking_approved.to_csv(
-            all_onco_blocking_approved_path, sep="\t", index=False
-        )
-        print(
-            f"Лекарства (DrugBank-approved), блокирующие любые онкогены пациента: "
-            f"{len(all_onco_blocking_approved)} строк → {all_onco_blocking_approved_path}"
-        )
-
-        if not all_onco_blocking_approved.empty:
-            df_sorted_all = all_onco_blocking_approved.copy()
-            df_sorted_all["affinity_nM"] = df_sorted_all[
-                "original_affinity_median_nm"
-            ].apply(parse_affinity)
-            df_sorted_all = df_sorted_all.sort_values(
-                by=["affinity_nM", "oncogene_symbol", "ligand_name"],
-                ascending=[True, True, True],
-            )
-            sorted_all_path = (
-                out_dir / "all_oncogene_blocking_drugs_approved_sorted_by_affinity.tsv"
-            )
-            df_sorted_all.to_csv(sorted_all_path, sep="\t", index=False)
-            print(
-                f"Все онкогены: approved-блокаторы, отсортированные по аффинности "
-                f"→ {sorted_all_path}"
-            )
-
+    # --- 4) Супрессоры с препаратами ---------------------------------------
     tsg_activating_drugs_df = build_tsg_activating_drugs(
         oncogene_tsg_df=oncogene_tsg_df,
         interactions=interactions,
+        logfc_map=rna_logfc,
         human_only=human_only,
-        primary_only=primary_only,
     )
 
     tsg_drugs_path = out_dir / "tsg_activating_drugs.tsv"
     tsg_activating_drugs_df.to_csv(tsg_drugs_path, sep="\t", index=False)
     print(
-        f"Супрессоры с активирующими лигандами: {len(tsg_activating_drugs_df)} "
-        f"строк → {tsg_drugs_path}"
+        f"Супрессоры с препаратами: "
+        f"{len(tsg_activating_drugs_df)} строк → {tsg_drugs_path}"
     )
 
-    # при наличии DrugBank XML — фильтрация
-    if args.drugbank_xml is not None:
-        approved_df = load_approved_ligands(args.drugbank_xml)
-        tsg_activating_approved = filter_approved(
-            tsg_activating_drugs_df, approved_df
-        )
-        tsg_activating_approved_path = out_dir / "tsg_activating_drugs_approved.tsv"
-        tsg_activating_approved.to_csv(
-            tsg_activating_approved_path, sep="\t", index=False
-        )
-        print(
-            f"Супрессоры с активирующими DrugBank-approved препаратами: "
-            f"{len(tsg_activating_approved)} строк → {tsg_activating_approved_path}"
-        )
+    tsg_activating_approved_path = out_dir / "tsg_activating_drugs_approved.tsv"
+    tsg_activating_drugs_df.to_csv(
+        tsg_activating_approved_path, sep="\t", index=False
+    )
+    print(
+        f"(Approved) супрессоры с препаратами: "
+        f"{len(tsg_activating_drugs_df)} строк → "
+        f"{tsg_activating_approved_path}"
+    )
 
-        # для сортировки по аффинности (нМ)
-        if not tsg_activating_approved.empty:
-            df_sorted = tsg_activating_approved.copy()
-            df_sorted["affinity_nM"] = df_sorted[
-                "original_affinity_median_nm"
-            ].apply(parse_affinity)
-            df_sorted = df_sorted.sort_values(
-                by=["affinity_nM", "tsg_symbol", "ligand_name"],
-                ascending=[True, True, True],
-            )
-            sorted_path = out_dir / "tsg_activating_drugs_approved_sorted_by_affinity.tsv"
-            df_sorted.to_csv(sorted_path, sep="\t", index=False)
-            print(
-                f"Супрессоры: approved-препараты, отсортированные по аффинности → "
-                f"{sorted_path}"
-            )
-
-    # --- 4) Для онкогенов, блокирующих эти супрессоры, ищем блокирующие их лиганды ---
+    # --- 5) Онкогены с препаратами (через TSG) -----------------------------
     oncogene_blocking_drugs_df = build_oncogene_blocking_drugs(
         oncogene_tsg_df=oncogene_tsg_df,
         tsg_activating_drugs_df=tsg_activating_drugs_df,
         interactions=interactions,
+        logfc_map=rna_logfc,
         human_only=human_only,
-        primary_only=primary_only,
     )
 
     onco_drugs_path = out_dir / "oncogene_blocking_drugs.tsv"
     oncogene_blocking_drugs_df.to_csv(onco_drugs_path, sep="\t", index=False)
     print(
-        f"Онкогены с блокирующими лигандами: {len(oncogene_blocking_drugs_df)} "
-        f"строк → {onco_drugs_path}"
+        f"Онкогены с препаратами: "
+        f"{len(oncogene_blocking_drugs_df)} строк → {onco_drugs_path}"
     )
 
-    if args.drugbank_xml is not None:
-        approved_df = load_approved_ligands(args.drugbank_xml)
-        onco_blocking_approved = filter_approved(
-            oncogene_blocking_drugs_df, approved_df
-        )
-        onco_blocking_approved_path = (
-            out_dir / "oncogene_blocking_drugs_approved.tsv"
-        )
-        onco_blocking_approved.to_csv(
-            onco_blocking_approved_path, sep="\t", index=False
-        )
-        print(
-            f"Онкогены: блокирующие DrugBank-approved препараты: "
-            f"{len(onco_blocking_approved)} строк → {onco_blocking_approved_path}"
-        )
+    onco_blocking_approved_path = (
+        out_dir / "oncogene_blocking_drugs_approved.tsv"
+    )
+    oncogene_blocking_drugs_df.to_csv(
+        onco_blocking_approved_path, sep="\t", index=False
+    )
+    print(
+        f"(Approved) онкогены с препаратами: "
+        f"{len(oncogene_blocking_drugs_df)} строк → "
+        f"{onco_blocking_approved_path}"
+    )
 
-        if not onco_blocking_approved.empty:
-            df_sorted = onco_blocking_approved.copy()
-            df_sorted["affinity_nM"] = df_sorted[
-                "original_affinity_median_nm"
-            ].apply(parse_affinity)
-            sorted_path = (
-                out_dir / "oncogene_blocking_drugs_approved_sorted_by_affinity.tsv"
-            )
-            df_sorted = df_sorted.sort_values(
-                by=["affinity_nM", "oncogene_symbol", "ligand_name"],
-                ascending=[True, True, True],
-            )
-            df_sorted.to_csv(sorted_path, sep="\t", index=False)
-            print(
-                f"Онкогены: approved-блокаторы, отсортированные по аффинности → {sorted_path}"
-            )
+    # --- 6) Итоговые списки препаратов с сортировкой по |log2FoldChange| ---
 
-    # --- 5) Итоговые списки препаратов -------------------------------------
-    # а) препараты-активаторы супрессоров
+    # a) препараты для супрессоров
     activator_list_path = out_dir / "tsg_activator_drug_list.tsv"
     if not tsg_activating_drugs_df.empty:
+        tmp = tsg_activating_drugs_df.copy()
+        if "abs_log2FoldChange" not in tmp.columns:
+            tmp["log2FoldChange"] = tmp["tsg_symbol"].map(rna_logfc)
+            tmp["abs_log2FoldChange"] = tmp["log2FoldChange"].abs()
+
         activator_list = (
-            tsg_activating_drugs_df["ligand_name"]
-            .dropna()
-            .astype(str)
-            .str.strip()
-            .drop_duplicates()
-            .sort_values()
-            .to_frame(name="ligand_name")
+            tmp.groupby("ligand_name", as_index=False)
+               .agg(max_abs_log2FoldChange=("abs_log2FoldChange", "max"))
+               .sort_values("max_abs_log2FoldChange", ascending=False)
         )
+        activator_list = activator_list[["ligand_name"]]
     else:
         activator_list = pd.DataFrame(columns=["ligand_name"])
     activator_list.to_csv(activator_list_path, sep="\t", index=False)
     print(
-        f"Итоговый список активаторов супрессоров: {len(activator_list)} препаратов "
-        f"→ {activator_list_path}"
+        f"Итоговый список препаратов для супрессоров (отсортирован по |log2FoldChange(TSG)|): "
+        f"{len(activator_list)} препаратов → {activator_list_path}"
     )
 
-    # б) препараты-блокаторы онкогенов (связаны с супрессорами)
+    # б) препараты для онкогенов (связанных с супрессорами)
     blocker_list_path = out_dir / "oncogene_blocker_drug_list.tsv"
     if not oncogene_blocking_drugs_df.empty:
+        tmp = oncogene_blocking_drugs_df.copy()
+        if "abs_log2FoldChange" not in tmp.columns:
+            tmp["log2FoldChange"] = tmp["oncogene_symbol"].map(rna_logfc)
+            tmp["abs_log2FoldChange"] = tmp["log2FoldChange"].abs()
+
         blocker_list = (
-            oncogene_blocking_drugs_df["ligand_name"]
-            .dropna()
-            .astype(str)
-            .str.strip()
-            .drop_duplicates()
-            .sort_values()
-            .to_frame(name="ligand_name")
+            tmp.groupby("ligand_name", as_index=False)
+               .agg(max_abs_log2FoldChange=("abs_log2FoldChange", "max"))
+               .sort_values("max_abs_log2FoldChange", ascending=False)
         )
+        blocker_list = blocker_list[["ligand_name"]]
     else:
         blocker_list = pd.DataFrame(columns=["ligand_name"])
     blocker_list.to_csv(blocker_list_path, sep="\t", index=False)
     print(
-        f"Итоговый список блокаторов онкогенов: {len(blocker_list)} препаратов "
-        f"→ {blocker_list_path}"
+        f"Итоговый список препаратов для онкогенов (через TSG, отсортирован по |log2FoldChange(онкогена)|): "
+        f"{len(blocker_list)} препаратов → {blocker_list_path}"
     )
 
-    # в) блокаторы любых онкогенов пациента
+    # в) все препараты для любых онкогенов пациента
     all_onco_blocker_list_path = out_dir / "all_oncogene_blocker_drug_list.tsv"
     if not all_onco_blocking_drugs_df.empty:
+        tmp = all_onco_blocking_drugs_df.copy()
+        if "abs_log2FoldChange" not in tmp.columns:
+            tmp["log2FoldChange"] = tmp["oncogene_symbol"].map(rna_logfc)
+            tmp["abs_log2FoldChange"] = tmp["log2FoldChange"].abs()
+
         all_blocker_list = (
-            all_onco_blocking_drugs_df["ligand_name"]
-            .dropna()
-            .astype(str)
-            .str.strip()
-            .drop_duplicates()
-            .sort_values()
-            .to_frame(name="ligand_name")
+            tmp.groupby("ligand_name", as_index=False)
+               .agg(max_abs_log2FoldChange=("abs_log2FoldChange", "max"))
+               .sort_values("max_abs_log2FoldChange", ascending=False)
         )
+        all_blocker_list = all_blocker_list[["ligand_name"]]
     else:
         all_blocker_list = pd.DataFrame(columns=["ligand_name"])
     all_blocker_list.to_csv(all_onco_blocker_list_path, sep="\t", index=False)
     print(
-        f"Итоговый список блокаторов любых онкогенов: "
+        f"Итоговый список препаратов для любых онкогенов (отсортирован по |log2FoldChange(онкогена)|): "
         f"{len(all_blocker_list)} препаратов → {all_onco_blocker_list_path}"
     )
 
